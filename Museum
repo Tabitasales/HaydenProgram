@@ -7,127 +7,253 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-DATABASE = 'pdf_texts.db'
+# ------------ Configuration ------------ #
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(BASE_DIR, "pdf_texts.db")
+PDF_DIR = os.path.join(BASE_DIR, "pdf_files")
+
+SNIPPET_CHARS_BEFORE = 80
+SNIPPET_CHARS_AFTER = 120
+MAX_SNIPPETS_PER_FILE = 5
+
+
+# ------------ Database helpers ------------ #
 
 def get_db():
-    """Open a new database connection if there is none yet for the current application context."""
-    if 'db' not in g:
-        g.db = sqlite3.connect(DATABASE)
+    """Get a database connection for the current request."""
+    if "db" not in g:
+        conn = sqlite3.connect(DATABASE)
+        conn.row_factory = sqlite3.Row
+        g.db = conn
+        init_db(conn)
     return g.db
 
-def close_db(e=None):
+
+def init_db(conn=None):
+    """Create the table if it doesn't exist yet."""
+    close_after = False
+
+    if conn is None:
+        conn = sqlite3.connect(DATABASE)
+        conn.row_factory = sqlite3.Row
+        close_after = True
+
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_texts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL UNIQUE,
+            content  TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+    if close_after:
+        conn.close()
+
+
+@app.teardown_appcontext
+def close_db(exception=None):
     """Close the database connection at the end of the request."""
-    db = g.pop('db', None)
+    db = g.pop("db", None)
     if db is not None:
         db.close()
 
-app.teardown_appcontext(close_db)
 
-def pdf_to_text(pdf_path):
-    """Convert PDF pages to text using PyMuPDF."""
+# ------------ PDF utilities ------------ #
+
+def pdf_to_text(pdf_path: str) -> str:
+    """Convert a PDF file to clean text using PyMuPDF."""
     try:
         doc = fitz.open(pdf_path)
-        text = ""
+        text_chunks = []
+
         for page_num in range(doc.page_count):
             page = doc.load_page(page_num)
-            text += page.get_text()
-        
-        readable_text = ' '.join(text.replace('\n', ' ').split())
+            text_chunks.append(page.get_text())
+
+        raw_text = "\n".join(text_chunks)
+        # Normalise whitespace: remove extra newlines and spaces
+        readable_text = " ".join(raw_text.split())
         return readable_text
+
     except Exception as e:
-        print(f"Error in pdf_to_text: {e}")
+        print(f"Error in pdf_to_text for {pdf_path}: {e}")
         return ""
 
-def index_pdf(db, filename, content):
-    """Insert PDF text into the database."""
+
+def index_pdf(db, filename: str, content: str):
+    """Insert or update PDF text in the database."""
+    if not content.strip():
+        # Don't index empty content
+        return
+
     try:
         cursor = db.cursor()
-        cursor.execute("INSERT INTO pdf_texts (filename, content) VALUES (?, ?)", (filename, content))
+        cursor.execute(
+            """
+            INSERT INTO pdf_texts (filename, content)
+            VALUES (?, ?)
+            ON CONFLICT(filename) DO UPDATE SET content=excluded.content
+            """,
+            (filename, content),
+        )
         db.commit()
     except Exception as e:
-        print(f"Error in index_pdf: {e}")
+        print(f"Error in index_pdf for {filename}: {e}")
+
 
 def process_pdfs_in_directory():
-    """Process all PDFs in the 'pdf_files' directory."""
-    pdf_dir = 'pdf_files'
-    if not os.path.exists(pdf_dir):
-        os.makedirs(pdf_dir)
+    """
+    Process all PDFs in the PDF_DIR directory.
 
-    for filename in os.listdir(pdf_dir):
-        if filename.lower().endswith('.pdf'):
-            pdf_path = os.path.join(pdf_dir, filename)
-            print(f"Processing {filename}...")
-            readable_text = pdf_to_text(pdf_path)
-            db = get_db()
-            index_pdf(db, filename, readable_text)
+    - Creates the directory if it doesn't exist.
+    - Skips files already indexed (by filename).
+    - (Re-)indexes PDFs if they are new or changed (by filename, via UPSERT).
+    """
+    if not os.path.exists(PDF_DIR):
+        os.makedirs(PDF_DIR)
 
-@app.route('/')
+    db = get_db()
+    existing_filenames = {
+        row["filename"]
+        for row in db.execute("SELECT filename FROM pdf_texts")
+    }
+
+    for filename in os.listdir(PDF_DIR):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        pdf_path = os.path.join(PDF_DIR, filename)
+
+        # Optional: skip already-indexed files
+        if filename in existing_filenames:
+            print(f"Skipping already indexed: {filename}")
+            continue
+
+        print(f"Indexing {filename}...")
+        readable_text = pdf_to_text(pdf_path)
+        index_pdf(db, filename, readable_text)
+
+
+# ------------ Snippet / search helpers ------------ #
+
+def build_snippets(content: str, query: str) -> list[str]:
+    """
+    Build highlighted snippets around each occurrence of query in content.
+    Returns a list of snippet strings with <mark> tags.
+    """
+    if not content or not query:
+        return []
+
+    content_lower = content.lower()
+    query_lower = query.lower()
+    q_len = len(query)
+    snippets = []
+    pos = 0
+
+    while len(snippets) < MAX_SNIPPETS_PER_FILE:
+        start = content_lower.find(query_lower, pos)
+        if start == -1:
+            break
+
+        snippet_start = max(start - SNIPPET_CHARS_BEFORE, 0)
+        snippet_end = min(start + q_len + SNIPPET_CHARS_AFTER, len(content))
+
+        before = content[snippet_start:start]
+        match_text = content[start:start + q_len]
+        after = content[start + q_len:snippet_end]
+
+        snippet = f"{before}<mark>{match_text}</mark>{after}"
+
+        # Add ellipses if we cut off at boundaries
+        if snippet_start > 0:
+            snippet = "..." + snippet
+        if snippet_end < len(content):
+            snippet = snippet + "..."
+
+        snippets.append(snippet)
+        pos = start + q_len
+
+    return snippets
+
+
+# ------------ Routes ------------ #
+
+@app.route("/")
 def index():
     """Render the HTML page."""
-    return render_template('index.html')
+    # Make sure you have templates/index.html
+    return render_template("index.html")
 
-@app.route('/search')
+
+@app.route("/search")
 def search():
     """Search for content in the indexed PDFs."""
-    query = request.args.get('query')
-    if query:
-        try:
-            db = get_db()
-            cursor = db.cursor()
-            
-            # Fetch all PDFs containing the query (case-insensitive search)
-            cursor.execute("SELECT filename, content FROM pdf_texts WHERE LOWER(content) LIKE ?", ('%' + query.lower() + '%',))
-            results = cursor.fetchall()
+    query = request.args.get("query", "").strip()
+    if not query:
+        return jsonify(results=[])
 
-            search_results = {}
-            query_lower = query.lower()  # Convert the query to lowercase once for reuse
+    try:
+        db = get_db()
+        cursor = db.cursor()
 
-            for r in results:
-                original_content = r[1]  # Original content for highlighting and snippet extraction
-                lower_content = original_content.lower()  # Lowercase content for case-insensitive matching
-                start_index = 0
-                snippets = []  # Use a list to maintain order
+        # Case-insensitive search with COLLATE NOCASE
+        cursor.execute(
+            """
+            SELECT filename, content
+            FROM pdf_texts
+            WHERE content LIKE ? COLLATE NOCASE
+            """,
+            (f"%{query}%",),
+        )
+        rows = cursor.fetchall()
 
-                # Find all occurrences of the query in the content
-                while start_index < len(lower_content):
-                    start_index = lower_content.find(query_lower, start_index)
-                    if start_index == -1:
-                        break
+        final_results = []
+        for row in rows:
+            filename = row["filename"]
+            content = row["content"]
+            snippets = build_snippets(content, query)
 
-                    # Create a snippet of text around the match (50 characters before and after)
-                    snippet_start = max(start_index - 0, 0)
-                    snippet_end = min(start_index + 2000 + len(query_lower), len(original_content))
-                    snippet = original_content[snippet_start:snippet_end]
+            if snippets:
+                final_results.append(
+                    {
+                        "filename": filename,
+                        "snippets": snippets,
+                    }
+                )
 
-                    # Highlight the query in the snippet (case-insensitive matching)
-                    snippet_highlighted = snippet.replace(original_content[start_index:start_index + len(query)], f"<mark>{original_content[start_index:start_index + len(query)]}</mark>", 1)
+        return jsonify(results=final_results)
 
-                    # Add the snippet to the list if it's not already there
-                    if snippet_highlighted not in snippets:
-                        snippets.append('...' + snippet_highlighted + '...')
-
-                    # Move to the next occurrence of the query
-                    start_index += len(query_lower)
-
-                # Combine all unique snippets into one paragraph for each PDF
-                if snippets:
-                    if r[0] in search_results:
-                        search_results[r[0]] += ' '.join(snippets)
-                    else:
-                        search_results[r[0]] = ' '.join(snippets)
-
-            # Format the final output for JSON response
-            final_results = [{'filename': filename, 'content': content} for filename, content in search_results.items()]
-            return jsonify(results=final_results)
-
-        except Exception as e:
-            print(f"Error in search: {e}")
-            return jsonify({'error': 'Error performing search'}), 500
-    return jsonify(results=[])
+    except Exception as e:
+        print(f"Error in /search: {e}")
+        return jsonify({"error": "Error performing search"}), 500
 
 
+# Optional: endpoint to reindex PDFs manually via HTTP
+@app.route("/reindex", methods=["POST"])
+def reindex():
+    """
+    Reindex all PDFs in the directory.
+    Call this if you add new files without restarting the server.
+    """
+    try:
+        process_pdfs_in_directory()
+        return jsonify({"status": "ok", "message": "Reindex completed."})
+    except Exception as e:
+        print(f"Error in /reindex: {e}")
+        return jsonify({"error": "Error reindexing PDFs"}), 500
 
-if __name__ == '__main__':
+
+# ------------ Entry point ------------ #
+
+if __name__ == "__main__":
+    # Make sure DB & PDFs are ready, then index
     with app.app_context():
-        process_pdfs_in_directory()  # Process and index all PDFs before starting the server
+        init_db()
+        process_pdfs_in_directory()
+
     app.run(debug=True)
